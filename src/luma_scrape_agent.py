@@ -134,10 +134,12 @@ async def _extract_event_details(url: str) -> dict[str, Any]:
 
 Return a JSON object with:
 - title: event title
-- date_text: date and time as shown
-- venue_text: location or "Online" if virtual
-- organizer_text: who is hosting
+- date_text: the event date and time (e.g. "January 25, 2026 6:00 PM" or "Jan 25, 2026"). Look for the date near the top of the page.
+- venue_text: location address or "Online" if virtual
+- organizer_text: who is hosting the event
 - description_text: event description (first 500 chars)
+
+IMPORTANT: Make sure to extract the actual date - look for patterns like "January 25", "Jan 25, 2026", "Tuesday, January 25" etc.
 
 Return ONLY the JSON object, no other text."""
 
@@ -328,11 +330,17 @@ def scrape_luma_events_with_agent(
         matched_topics = relevance.get("matched_topics", [])
         
         print(f"[DEBUG] Event {idx+1}: '{title[:40]}' | relevant={is_relevant} | score={rel_score:.2f}")
+        print(f"[DEBUG]   date_text: '{date_text[:60] if date_text else 'EMPTY'}'")
         if rel_reason:
             print(f"[DEBUG]   reason: {rel_reason[:80]}")
 
-        # Parse date
-        dt = parse_datetime_loose(date_text or extracted.get("description_text") or "")
+        # Parse date - try multiple sources
+        dt = parse_datetime_loose(date_text) if date_text else None
+        if not dt and extracted.get("description_text"):
+            # Try parsing from description if date_text failed
+            dt = parse_datetime_loose(extracted.get("description_text", "")[:200])
+        
+        print(f"[DEBUG]   parsed_date: {dt}")
 
         ev = Event(
             url=url,
@@ -347,17 +355,22 @@ def scrape_luma_events_with_agent(
             matched_keywords=matched_topics,
         )
 
-        # Filters with debug
-        if not is_within_days(ev.start_at, days=days, now=now):
-            print(f"[DEBUG]   -> FILTERED: date {ev.start_at} not within {days} days")
-            continue
-        if region == "sf_bay" and not looks_like_sf_bay(venue_raw, sf_terms):
-            print(f"[DEBUG]   -> FILTERED: venue not SF Bay")
-            continue
-
-        # Use agent-based relevance instead of keyword matching
+        # Check relevance FIRST (most important filter)
         if not is_relevant or rel_score < 0.3:
             print(f"[DEBUG]   -> FILTERED: not relevant to Judgment Labs")
+            continue
+
+        # Date filter - be lenient if we can't parse the date but event is relevant
+        if dt is not None and not is_within_days(dt, days=days, now=now):
+            print(f"[DEBUG]   -> FILTERED: date {dt} not within {days} days")
+            continue
+        elif dt is None:
+            # Can't parse date - include anyway if relevant (assume it's upcoming)
+            print(f"[DEBUG]   -> WARNING: Could not parse date, including anyway (relevant event)")
+        
+        # Geo filter
+        if region == "sf_bay" and not looks_like_sf_bay(venue_raw, sf_terms):
+            print(f"[DEBUG]   -> FILTERED: venue not SF Bay")
             continue
 
         events.append(ev)
