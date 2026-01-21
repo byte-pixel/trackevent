@@ -47,6 +47,7 @@ def score_relevance(event: Event, keywords: set[str]) -> Event:
         ]
     )
     hits = keyword_hits(blob, keywords)
+    print(f"[DEBUG] keyword hits: {hits}")
     # Simple scoring: title hits weigh more.
     title_hits = keyword_hits(event.title or "", keywords)
     score = float(len(hits) + len(title_hits) * 1.5)
