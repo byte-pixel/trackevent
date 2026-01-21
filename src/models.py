@@ -28,4 +28,5 @@ class Event(BaseModel):
 
     relevance_score: float = 0.0
     matched_keywords: list[str] = Field(default_factory=list)
+    relevance_reason: Optional[str] = None  # Why this event was included
 
