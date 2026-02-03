@@ -32,6 +32,8 @@ python -m pip install -r requirements.txt
 
 ## Run
 
+### CLI
+
 ```powershell
 python main.py --days 14 --region sf_bay --headless
 ```
@@ -39,6 +41,44 @@ python main.py --days 14 --region sf_bay --headless
 Outputs:
 - `out/events.json`
 - `out/events.csv`
+
+### Slack Bot
+
+Run the Slack bot to get events via mentions:
+
+```powershell
+python slack_bot.py
+```
+
+**Setup:**
+
+1. Create a Slack app at https://api.slack.com/apps
+2. Enable **Socket Mode** in your app settings (under "Socket Mode")
+3. Create an App-Level Token with `connections:write` scope (for Socket Mode)
+
+4. Enable **Event Subscriptions** and subscribe to the `app_mentions` event
+5. Add the following OAuth Bot Token Scopes (under "OAuth & Permissions"):
+   - `chat:write` - Send messages
+   - `im:read` - Read direct messages
+6. Install the app to your workspace (under "Install App")
+7. Copy the **Bot Token** (starts with `xoxb-`) and **App-Level Token** (starts with `xapp-`)
+8. Add to your `.env`:
+   ```
+   SLACK_BOT_TOKEN=xoxb...
+   SLACK_APP_TOKEN=xapp...
+
+   ```
+
+**Usage:**
+
+- Mention the bot in any channel: `@YourBotName` - it will scrape and post relevant events
+- The bot responds with formatted event cards showing:
+  - Event title (clickable link)
+  - Date and time
+  - Location
+  - Relevance score
+  - Why it's relevant
+  - Matched topics/keywords
 
 ## Online Monitoring (Judgment Labs)
 

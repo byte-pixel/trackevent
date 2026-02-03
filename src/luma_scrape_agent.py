@@ -14,8 +14,8 @@ from judgeval.data import Example
 from anthropic import Anthropic
 from claude_agent_sdk import query, ClaudeAgentOptions
 
-from .filtering import is_within_days, looks_like_sf_bay, parse_datetime_loose
-from .models import Event, Organizer, Venue
+from src.filtering import is_within_days, looks_like_sf_bay, parse_datetime_loose
+from src.models import Event, Organizer, Venue
 
 
 # Initialize tracer for online monitoring
@@ -63,7 +63,7 @@ def _extract_urls_from_text(text: str) -> list[str]:
 
 
 @judgment.observe(span_type="chain")
-async def _run_agent_sdk(days: int, max_events: int) -> dict[str, Any]:
+async def _run_agent_sdk(days: int, max_events: int, timeout_seconds: int = 180) -> dict[str, Any]:
     """Run the Claude Agent SDK to collect Luma event URLs."""
     
     prompt = f"""Navigate to https://lu.ma/sf to find San Francisco Bay Area events.
@@ -80,38 +80,45 @@ Return your final answer as a JSON object like this:
 
 Focus on tech/AI related events if you can identify them from titles."""
 
-    collected_urls: list[str] = []
-    final_result = ""
-    
-    # Use Playwright MCP for browser automation
-    async for message in query(
-        prompt=prompt,
-        options=ClaudeAgentOptions(
-            allowed_tools=["WebFetch", "WebSearch"],
-        )
-    ):
-        # Collect output
-        if hasattr(message, "result"):
-            final_result = message.result
-        elif hasattr(message, "content"):
-            content = str(message.content)
-            # Extract URLs as we go
-            urls = _extract_urls_from_text(content)
+    async def _collect_urls():
+        collected_urls: list[str] = []
+        final_result = ""
+        
+        # Use Playwright MCP for browser automation
+        async for message in query(
+            prompt=prompt,
+            options=ClaudeAgentOptions(
+                allowed_tools=["WebFetch", "WebSearch"],
+            )
+        ):
+            # Collect output
+            if hasattr(message, "result"):
+                final_result = message.result
+            elif hasattr(message, "content"):
+                content = str(message.content)
+                # Extract URLs as we go
+                urls = _extract_urls_from_text(content)
+                collected_urls.extend(urls)
+                print(f"[DEBUG] Found {len(urls)} URLs in message")
+        
+        # Try to parse final result as JSON
+        if final_result:
+            parsed = _extract_json_from_text(final_result)
+            if parsed and "event_urls" in parsed:
+                return parsed
+            # Also try extracting URLs from final result
+            urls = _extract_urls_from_text(final_result)
             collected_urls.extend(urls)
-            print(f"[DEBUG] Found {len(urls)} URLs in message")
+        
+        # Dedupe and return
+        collected_urls = list(dict.fromkeys(collected_urls))
+        return {"event_urls": collected_urls[:max_events]}
     
-    # Try to parse final result as JSON
-    if final_result:
-        parsed = _extract_json_from_text(final_result)
-        if parsed and "event_urls" in parsed:
-            return parsed
-        # Also try extracting URLs from final result
-        urls = _extract_urls_from_text(final_result)
-        collected_urls.extend(urls)
-    
-    # Dedupe and return
-    collected_urls = list(dict.fromkeys(collected_urls))
-    return {"event_urls": collected_urls[:max_events]}
+    try:
+        return await asyncio.wait_for(_collect_urls(), timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        print(f"[WARN] URL collection timed out after {timeout_seconds}s, returning partial results")
+        return {"event_urls": []}
 
 
 JUDGMENT_LABS_CONTEXT = """Judgment Labs is an applied research lab focused on:
@@ -127,7 +134,7 @@ model evaluation, prompt engineering, AI safety, AI observability, agent framewo
 
 
 @judgment.observe(span_type="tool")
-async def _extract_event_details(url: str) -> dict[str, Any]:
+async def _extract_event_details(url: str, timeout_seconds: int = 60) -> dict[str, Any]:
     """Use Agent SDK to extract event details from a single Luma page."""
     
     prompt = f"""Fetch {url} and extract the event details.
@@ -145,20 +152,31 @@ Return ONLY the JSON object, no other text."""
 
     result = {"url": url, "title": "", "date_text": "", "venue_text": "", "organizer_text": "", "description_text": ""}
     
+    async def _extract_inner():
+        try:
+            async for message in query(
+                prompt=prompt,
+                options=ClaudeAgentOptions(
+                    allowed_tools=["WebFetch"],
+                )
+            ):
+                if hasattr(message, "result"):
+                    parsed = _extract_json_from_text(message.result)
+                    if parsed:
+                        result.update(parsed)
+                        result["url"] = url
+                        return result  # Return early if we got a result
+        except Exception as e:
+            print(f"[WARN] Failed to extract details from {url}: {e}")
+        return result
+    
     try:
-        async for message in query(
-            prompt=prompt,
-            options=ClaudeAgentOptions(
-                allowed_tools=["WebFetch"],
-            )
-        ):
-            if hasattr(message, "result"):
-                parsed = _extract_json_from_text(message.result)
-                if parsed:
-                    result.update(parsed)
-                    result["url"] = url
+        # Add timeout to prevent hanging
+        result = await asyncio.wait_for(_extract_inner(), timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        print(f"[WARN] Timeout ({timeout_seconds}s) extracting details from {url}")
     except Exception as e:
-        print(f"[WARN] Failed to extract details from {url}: {e}")
+        print(f"[WARN] Error extracting details from {url}: {e}")
     
     return result
 
@@ -236,25 +254,41 @@ def _check_relevance_all(events: list[dict]) -> list[dict]:
 
 
 @judgment.observe(span_type="function")
-async def _extract_all_events_parallel(urls: list[str], batch_size: int = 5) -> list[dict]:
+async def _extract_all_events_parallel(urls: list[str], batch_size: int = 5, timeout_per_batch: int = 90) -> list[dict]:
     """Extract event details in parallel batches for speed."""
     all_results = []
+    total_batches = (len(urls) + batch_size - 1) // batch_size
     
     for i in range(0, len(urls), batch_size):
         batch = urls[i:i + batch_size]
-        print(f"[INFO] Extracting batch {i//batch_size + 1} ({len(batch)} events)...")
+        batch_num = i//batch_size + 1
+        print(f"[INFO] Extracting batch {batch_num}/{total_batches} ({len(batch)} events)...")
         
-        # Run batch in parallel
-        tasks = [_extract_event_details(url) for url in batch]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        async def process_batch():
+            # Run batch in parallel with individual timeouts
+            tasks = [_extract_event_details(url, timeout_seconds=60) for url in batch]
+            return await asyncio.gather(*tasks, return_exceptions=True)
         
+        try:
+            # Add timeout for the entire batch
+            results = await asyncio.wait_for(process_batch(), timeout=timeout_per_batch)
+        except asyncio.TimeoutError:
+            print(f"[WARN] Batch {batch_num} timed out after {timeout_per_batch}s, skipping remaining events in batch")
+            # Create empty results for timed-out batch
+            results = [{"url": url, "title": "", "date_text": "", "venue_text": "", "organizer_text": "", "description_text": ""} 
+                      for url in batch]
+        
+        # Process results
         for url, result in zip(batch, results):
             if isinstance(result, Exception):
                 print(f"[WARN] Failed to load {url}: {result}")
                 all_results.append({"url": url, "title": "", "date_text": "", "venue_text": "", "organizer_text": "", "description_text": ""})
             else:
                 all_results.append(result)
+        
+        print(f"[INFO] Completed batch {batch_num}/{total_batches}")
     
+    print(f"[INFO] Finished extracting {len(all_results)} events")
     return all_results
 
 
