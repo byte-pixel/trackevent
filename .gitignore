@@ -2,3 +2,6 @@
 venv
 out
 src/__pycache__
+.env.clean
+.flyignore
+.dockerignore
