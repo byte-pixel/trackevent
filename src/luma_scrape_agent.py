@@ -399,28 +399,100 @@ async def _extract_event_details(url: str, timeout_seconds: int = 60) -> dict[st
             html = response.text
             logger.debug(f"✅ Fetched {len(html)} chars from {url}")
             
-            # Use BeautifulSoup to extract text content (cleaner for Claude)
+            # Use BeautifulSoup to parse HTML
             soup = BeautifulSoup(html, 'lxml')
-            # Remove script and style elements
+            
+            # Method 1: Look for structured data (JSON-LD, microdata)
+            date_candidates = []
+            
+            # Check for JSON-LD structured data
+            json_ld_scripts = soup.find_all('script', type='application/ld+json')
+            for script in json_ld_scripts:
+                try:
+                    data = json.loads(script.string)
+                    if isinstance(data, dict):
+                        # Look for startDate in event schema
+                        if data.get('@type') == 'Event' and data.get('startDate'):
+                            date_candidates.append(data['startDate'])
+                        # Also check if it's a list
+                    elif isinstance(data, list):
+                        for item in data:
+                            if isinstance(item, dict) and item.get('@type') == 'Event' and item.get('startDate'):
+                                date_candidates.append(item['startDate'])
+                except:
+                    pass
+            
+            # Method 2: Look for meta tags with dates
+            meta_tags = soup.find_all('meta')
+            for meta in meta_tags:
+                prop = meta.get('property', '') or meta.get('name', '')
+                content = meta.get('content', '')
+                if any(keyword in prop.lower() for keyword in ['date', 'time', 'event', 'start']):
+                    if content and len(content) > 5:
+                        date_candidates.append(content)
+            
+            # Method 3: Search HTML for date patterns before removing scripts
+            date_patterns = [
+                r'\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}',
+                r'\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}',
+                r'\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}',
+                r'\d{1,2}/\d{1,2}/\d{4}',
+                r'\d{4}-\d{2}-\d{2}',
+                r'\b\d{1,2}:\d{2}\s*(AM|PM|am|pm)',
+            ]
+            
+            # Search in visible text and attributes
+            all_text = soup.get_text(separator=' ', strip=True)
+            for pattern in date_patterns:
+                matches = re.findall(pattern, all_text, re.IGNORECASE)
+                if matches:
+                    # Take first few matches
+                    date_candidates.extend([m if isinstance(m, str) else ' '.join(m) for m in matches[:3]])
+            
+            # Also search in data attributes and class names that might contain dates
+            for elem in soup.find_all(attrs=True):
+                for attr_name, attr_value in elem.attrs.items():
+                    if isinstance(attr_value, str) and any(keyword in attr_name.lower() for keyword in ['date', 'time']):
+                        if len(attr_value) > 5 and len(attr_value) < 50:
+                            date_candidates.append(attr_value)
+            
+            # Remove duplicates and clean up
+            date_candidates = list(dict.fromkeys(date_candidates))[:10]  # Keep first 10 unique
+            
+            # Remove script and style elements for text extraction
             for script in soup(["script", "style"]):
                 script.decompose()
             text_content = soup.get_text(separator=' ', strip=True)
-            # Limit to first 8000 chars to avoid token limits
-            text_content = text_content[:8000]
+            # Increase limit to include more context for date finding
+            text_content = text_content[:10000]
+            
+            # Build date hint for Claude
+            date_hint = ""
+            if date_candidates:
+                date_hint = f"\n\nPOTENTIAL DATES FOUND IN PAGE: {', '.join(date_candidates[:5])}\nUse these as hints to find the actual event date/time."
             
             # Use Anthropic API directly to extract structured data
             prompt = f"""Extract event details from this Luma event page HTML content:
 
-{text_content}
+{text_content}{date_hint}
 
 Return a JSON object with:
 - title: event title
-- date_text: the event date and time (e.g. "January 25, 2026 6:00 PM" or "Jan 25, 2026")
+- date_text: the event date and time in a clear, complete format (e.g. "January 25, 2026 6:00 PM" or "Jan 25, 2026 at 6:00 PM" or "Tuesday, January 25, 2026")
 - venue_text: location address or "Online" if virtual
 - organizer_text: who is hosting the event
 - description_text: event description (first 500 chars)
 
-IMPORTANT: Make sure to extract the actual date - look for patterns like "January 25", "Jan 25, 2026", "Tuesday, January 25" etc.
+CRITICAL: The date is very important! Look carefully for:
+- Full dates like "January 25, 2026" or "Jan 25, 2026"
+- Dates with times like "January 25, 2026 at 6:00 PM" or "Jan 25, 2026 6:00 PM"
+- Day names like "Tuesday, January 25, 2026"
+- ISO dates like "2026-01-25"
+- Times like "6:00 PM" or "18:00"
+- Any date/time information in the page
+
+If you see potential dates listed above, use them as hints to find the actual event date.
+The date might be in various formats - extract it in a clear, readable format.
 
 Return ONLY the JSON object, no other text."""
 
@@ -437,6 +509,8 @@ Return ONLY the JSON object, no other text."""
                 result.update(parsed)
                 result["url"] = url
                 logger.debug(f"✅ Extracted details for {url}: {result.get('title', 'no title')[:50]}")
+                if date_candidates and not result.get("date_text"):
+                    logger.debug(f"💡 Found {len(date_candidates)} date candidates but Claude didn't extract date")
             else:
                 logger.warning(f"⚠️ Could not parse JSON from API response for {url}")
                 
