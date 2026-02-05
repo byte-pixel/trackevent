@@ -102,7 +102,89 @@ The agent uses the Claude Agent SDK with built-in `WebFetch` and `WebSearch` too
 3. **Filtering**: Events filtered by date (next N days), region (SF Bay), and relevance (keywords)
 4. **Monitoring**: All agent actions traced via Judgeval; outputs scored for relevancy
 
+## Deployment to Fly.io (Free Tier)
+
+Deploy the Slack bot to Fly.io for 24/7 operation:
+
+### Prerequisites
+1. Install [Fly CLI](https://fly.io/docs/hands-on/install-flyctl/)
+2. Sign up for a free Fly.io account: `fly auth signup`
+3. Login: `fly auth login`
+
+### Deploy
+
+1. **Initialize Fly.io app** (first time only):
+   ```powershell
+   fly launch --no-deploy
+   ```
+   - Choose an app name (or use default)
+   - Choose a region (e.g., `iad` for Washington D.C.)
+
+2. **Set environment variables** (choose one method):
+
+   **Option A: Import from .env file** (recommended):
+   ```powershell
+   # PowerShell syntax (strips BOM, empty lines, and comments)
+   Get-Content .env -Encoding UTF8 | 
+     Where-Object { $_ -match '^\s*[^#]' -and $_ -match '=' } | 
+     ForEach-Object { $_ -replace '^\ufeff','' -replace '^\s+','' -replace '\s+$','' } | 
+     fly secrets import
+   ```
+   
+   **Option B: Manual fix for BOM issue**:
+   ```powershell
+   # Create a clean version without BOM
+   $content = Get-Content .env -Raw -Encoding UTF8
+   $content = $content -replace '\ufeff',''
+   $content | Out-File .env.clean -Encoding UTF8 -NoNewline
+   Get-Content .env.clean | fly secrets import
+   ```
+   
+   > **Note**: If you get a BOM error (`\ufeff`), your .env file has a Byte Order Mark. The commands above will strip it. Alternatively, re-save your .env file as UTF-8 without BOM in VS Code (click encoding in bottom-right → "Save with Encoding" → "UTF-8").
+   
+   **Option B: Set individually**:
+   ```powershell
+   fly secrets set ANTHROPIC_API_KEY=your-key
+   fly secrets set JUDGMENT_API_KEY=your-key
+   fly secrets set SLACK_BOT_TOKEN=xoxb-your-token
+   fly secrets set SLACK_APP_TOKEN=xapp-your-token
+   ```
+   
+   **Option C: Set all at once**:
+   ```powershell
+   fly secrets set ANTHROPIC_API_KEY=your-key JUDGMENT_API_KEY=your-key SLACK_BOT_TOKEN=xoxb-your-token SLACK_APP_TOKEN=xapp-your-token
+   ```
+   
+   > **Note**: The `.env` file format should be `KEY=VALUE` (one per line, no spaces around `=`)
+
+3. **Deploy**:
+   ```powershell
+   fly deploy
+   ```
+
+4. **Check status**:
+   ```powershell
+   fly status
+   fly logs
+   ```
+
+### Fly.io Free Tier Limits
+- **3 shared-cpu-1x VMs** (256MB RAM each)
+- **3GB persistent volumes**
+- **160GB outbound data transfer/month**
+- **Unlimited inbound data**
+
+The Slack bot should fit comfortably within these limits.
+
+### Troubleshooting
+
+- **View logs**: `fly logs`
+- **SSH into machine**: `fly ssh console`
+- **Restart app**: `fly apps restart trackevents-bot`
+- **Scale**: The free tier allows 1 machine, which is sufficient for the bot
+
 ## Notes
-- The Claude Agent SDK requires Claude Code to be installed as its runtime
+- The Claude Agent SDK may work without Claude Code in cloud environments (uses WebFetch directly)
 - The `--headless` flag is ignored (SDK manages its own browser context)
+- Browser profile is stored in `out/browser_profile/` (ephemeral on Fly.io)
 

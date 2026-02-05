@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -12,10 +14,21 @@ from judgeval.scorers import FaithfulnessScorer, AnswerRelevancyScorer
 from judgeval.data import Example
 
 from anthropic import Anthropic
-from claude_agent_sdk import query, ClaudeAgentOptions
+import httpx
+from bs4 import BeautifulSoup
 
 from src.filtering import is_within_days, looks_like_sf_bay, parse_datetime_loose
 from src.models import Event, Organizer, Venue
+
+# Set up logging (will inherit from parent if already configured)
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        stream=sys.stdout,
+        force=True
+    )
 
 
 # Initialize tracer for online monitoring
@@ -51,73 +64,310 @@ def _extract_json_from_text(text: str) -> dict | None:
 
 @judgment.observe(span_type="tool")
 def _extract_urls_from_text(text: str) -> list[str]:
-    """Extract Luma event URLs from agent output text."""
-    urls = re.findall(r'https?://(?:lu\.ma|luma\.com)/[a-zA-Z0-9_-]+', text)
-    # Normalize luma.com -> lu.ma
+    """Extract Luma event URLs from text, filtering out user profiles and JSON property names."""
+    # Extract all potential URLs from lu.ma
+    # Pattern 1: Full URLs
+    urls = re.findall(r'https?://(?:lu\.ma|luma\.com)/([a-zA-Z0-9_-]+)', text)
+    # Pattern 2: URLs in quotes/JSON
+    urls.extend(re.findall(r'["\']https?://(?:lu\.ma|luma\.com)/([a-zA-Z0-9_-]+)["\']', text))
+    # Pattern 3: Relative URLs in href attributes
+    urls.extend(re.findall(r'href=["\']/?([a-zA-Z0-9_-]+)["\']', text))
+    
+    # Filter out JSON property names and invalid patterns
+    excluded = {
+        'sf', 'ios', 'android', 'web', 'about', 'help', 'privacy', 'terms', 
+        'login', 'signup', 'explore', 'discover', 'events', 'organizers',
+        'venues', 'contact', 'blog', 'jobs', 'press', 'api', 'docs',
+        'create', 'event', 'description', 'slug', 'url', 'image', 'info',
+        'hero_image_mobile_url', 'hero_image_desktop_url', 'is_free',
+        'virtual_info', 'personal_user', 'create', 'event', 'description'
+    }
+    
+    # Patterns that indicate JSON property names (not URLs)
+    json_patterns = [
+        r'^[a-z_]+$',  # snake_case (like hero_image_mobile_url)
+        r'^[a-z]+[A-Z]',  # camelCase
+    ]
+    
+    # Patterns that indicate non-event URLs
+    non_event_patterns = [
+        r'^usr-',  # User profiles
+        r'^cal-',  # Calendars
+        r'^org-',  # Organizations
+    ]
+    
     normalized = []
-    for u in urls:
-        u = u.replace("https://luma.com/", "https://lu.ma/")
-        u = u.replace("http://luma.com/", "https://lu.ma/")
-        normalized.append(u)
+    for url_id in urls:
+        url_id_clean = url_id.strip('/').split('/')[0].split('?')[0]
+        
+        # Skip if in excluded list
+        if url_id_clean.lower() in excluded:
+            continue
+        
+        # Skip if it looks like a JSON property name
+        if any(re.match(pattern, url_id_clean) for pattern in json_patterns):
+            continue
+        
+        # Skip if it's a non-event URL pattern (user profiles, calendars, etc.)
+        if any(re.match(pattern, url_id_clean) for pattern in non_event_patterns):
+            continue
+        
+        # Skip if it's too short (likely not a valid event ID)
+        # Reduced from 6 to 4 to catch more events
+        if len(url_id_clean) < 4:
+            continue
+        
+        # Skip if it's all lowercase and very short (likely a page path, not an event ID)
+        # But be more lenient - allow longer lowercase strings
+        if url_id_clean.islower() and len(url_id_clean) < 8:
+            # But allow if it starts with 'evt-' (known event prefix)
+            if not url_id_clean.startswith('evt-'):
+                continue
+        
+        # Include valid-looking event URLs
+        normalized.append(f"https://lu.ma/{url_id_clean}")
+    
     return list(dict.fromkeys(normalized))  # dedupe preserving order
 
 
 @judgment.observe(span_type="chain")
 async def _run_agent_sdk(days: int, max_events: int, timeout_seconds: int = 180) -> dict[str, Any]:
-    """Run the Claude Agent SDK to collect Luma event URLs."""
+    """Collect Luma event URLs using Playwright to render JavaScript-loaded content."""
     
-    prompt = f"""Navigate to https://lu.ma/sf to find San Francisco Bay Area events.
-
-Your task:
-1. Go to https://lu.ma/sf 
-2. Scroll through the page to load more events
-3. Extract all event URLs you can find (they look like https://lu.ma/eventid)
-4. Collect at least 20-30 event URLs happening in the next {days} days
-5. Return a JSON object with the URLs
-
-Return your final answer as a JSON object like this:
-{{"event_urls": ["https://lu.ma/abc123", "https://lu.ma/xyz456", ...]}}
-
-Focus on tech/AI related events if you can identify them from titles."""
-
-    async def _collect_urls():
-        collected_urls: list[str] = []
-        final_result = ""
-        
-        # Use Playwright MCP for browser automation
-        async for message in query(
-            prompt=prompt,
-            options=ClaudeAgentOptions(
-                allowed_tools=["WebFetch", "WebSearch"],
-            )
-        ):
-            # Collect output
-            if hasattr(message, "result"):
-                final_result = message.result
-            elif hasattr(message, "content"):
-                content = str(message.content)
-                # Extract URLs as we go
-                urls = _extract_urls_from_text(content)
-                collected_urls.extend(urls)
-                print(f"[DEBUG] Found {len(urls)} URLs in message")
-        
-        # Try to parse final result as JSON
-        if final_result:
-            parsed = _extract_json_from_text(final_result)
-            if parsed and "event_urls" in parsed:
-                return parsed
-            # Also try extracting URLs from final result
-            urls = _extract_urls_from_text(final_result)
-            collected_urls.extend(urls)
-        
-        # Dedupe and return
-        collected_urls = list(dict.fromkeys(collected_urls))
-        return {"event_urls": collected_urls[:max_events]}
+    logger.info("🌐 Using Playwright to fetch Luma SF page (rendering JavaScript)...")
+    all_urls = set()
+    html = None
     
     try:
-        return await asyncio.wait_for(_collect_urls(), timeout=timeout_seconds)
-    except asyncio.TimeoutError:
-        print(f"[WARN] URL collection timed out after {timeout_seconds}s, returning partial results")
+        from playwright.async_api import async_playwright
+        
+        async with async_playwright() as p:
+            # Launch browser in headless mode (memory efficient)
+            browser = await p.chromium.launch(headless=True)
+            try:
+                # Create a new page
+                page = await browser.new_page()
+                
+                # Try multiple Luma pages to get more events
+                pages_to_try = [
+                    "https://lu.ma/sf",
+                    "https://lu.ma/sf/events",
+                    "https://lu.ma/explore/sf",
+                ]
+                
+                html = None
+                for page_url in pages_to_try:
+                    try:
+                        logger.info(f"🌐 Loading {page_url} with Playwright...")
+                        # Navigate and wait for content to load
+                        await page.goto(page_url, wait_until="networkidle", timeout=30000)
+                        # Wait for JavaScript to render events
+                        await page.wait_for_timeout(3000)
+                        
+                        # Scroll down to load more events (Luma uses infinite scroll)
+                        logger.info("📜 Scrolling to load more events...")
+                        for scroll in range(5):  # Scroll 5 times
+                            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                            await page.wait_for_timeout(2000)  # Wait 2s between scrolls
+                            # Check if we've reached the bottom
+                            is_at_bottom = await page.evaluate("""
+                                window.innerHeight + window.scrollY >= document.body.scrollHeight - 100
+                            """)
+                            if is_at_bottom:
+                                logger.info(f"✅ Reached bottom after {scroll + 1} scrolls")
+                                break
+                        
+                        # Wait a bit more for any lazy-loaded content
+                        await page.wait_for_timeout(2000)
+                        html = await page.content()
+                        logger.info(f"✅ Rendered {page_url}: {len(html)} chars")
+                        break  # Use first successful page
+                    except Exception as e:
+                        logger.warning(f"⚠️ Failed to load {page_url}: {e}")
+                        continue
+                
+                if not html:
+                    # Fallback: try default page
+                    logger.warning("⚠️ All pages failed, trying default...")
+                    await page.goto("https://lu.ma/sf", wait_until="networkidle", timeout=30000)
+                    await page.wait_for_timeout(3000)
+                    # Scroll to load more
+                    for scroll in range(5):
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        await page.wait_for_timeout(2000)
+                    await page.wait_for_timeout(2000)
+                    html = await page.content()
+                    logger.info(f"✅ Rendered default page: {len(html)} chars")
+                
+                # Close page immediately to save memory
+                await page.close()
+            finally:
+                # Always close browser to free memory
+                await browser.close()
+            
+    except ImportError:
+        logger.warning("⚠️ Playwright not available, falling back to HTTP requests...")
+        # Fallback to HTTP requests if Playwright is not installed
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get("https://lu.ma/sf", follow_redirects=True)
+                response.raise_for_status()
+                html = response.text
+                logger.info(f"✅ Fetched via HTTP: {len(html)} chars")
+        except Exception as e:
+            logger.error(f"❌ HTTP fallback also failed: {e}")
+            return {"event_urls": []}
+    except Exception as e:
+        logger.error(f"❌ Error fetching Luma page with Playwright: {e}", exc_info=True)
+        # Try HTTP fallback
+        try:
+            logger.info("🔄 Attempting HTTP fallback...")
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get("https://lu.ma/sf", follow_redirects=True)
+                response.raise_for_status()
+                html = response.text
+                logger.info(f"✅ Fetched via HTTP fallback: {len(html)} chars")
+        except Exception as e2:
+            logger.error(f"❌ HTTP fallback also failed: {e2}")
+            return {"event_urls": []}
+    
+    # If we have HTML (from Playwright or HTTP fallback), extract URLs
+    if html:
+        # Method 1: Extract URLs from HTML using regex
+        urls_regex = _extract_urls_from_text(html)
+        all_urls.update(urls_regex)
+        logger.info(f"🔗 Found {len(urls_regex)} URLs via regex")
+        
+        # Method 2: Parse HTML with BeautifulSoup to find href attributes
+        soup = None
+        try:
+            soup = BeautifulSoup(html, 'lxml')
+            # Find all links that point to lu.ma events
+            links = soup.find_all('a', href=True)
+            excluded = {'sf', 'ios', 'android', 'web', 'about', 'help', 'privacy', 'terms', 
+                       'login', 'signup', 'explore', 'discover', 'events', 'organizers',
+                       'venues', 'contact', 'blog', 'jobs', 'press', 'api', 'docs',
+                       'create', 'event', 'description', 'slug', 'url', 'image', 'info'}
+            for link in links:
+                href = link.get('href', '')
+                if 'lu.ma' in href or 'luma.com' in href:
+                    # Make absolute URL
+                    if href.startswith('/'):
+                        href = 'https://lu.ma' + href
+                    elif not href.startswith('http'):
+                        href = 'https://lu.ma/' + href
+                    # Normalize
+                    href = href.replace('luma.com', 'lu.ma')
+                    if href.startswith('https://lu.ma/'):
+                        # Extract the ID part
+                        url_id = href.replace('https://lu.ma/', '').split('/')[0].split('?')[0]
+                        # Filter out user profiles (usr-), calendars (cal-), orgs (org-), and excluded pages
+                        if url_id.lower() in excluded:
+                            continue
+                        if url_id.startswith(('usr-', 'cal-', 'org-')):
+                            continue
+                            # Skip if too short (likely not an event) - reduced from 6 to 4
+                            if len(url_id) < 4:
+                                continue
+                            # Skip if it's all lowercase and very short (likely a page path)
+                            # Be more lenient - allow longer lowercase strings
+                            if url_id.islower() and len(url_id) < 8 and not url_id.startswith('evt-'):
+                                continue
+                        # Include valid-looking event URLs
+                        all_urls.add(href)
+            logger.info(f"🔗 Found {len(all_urls)} total URLs after parsing HTML")
+        except Exception as e:
+            logger.warning(f"⚠️ Error parsing HTML: {e}")
+        
+        # Method 3: Look for JSON data in script tags
+        if soup:
+            try:
+                scripts = soup.find_all('script')
+                excluded = {'sf', 'ios', 'android', 'web', 'about', 'help', 'privacy', 'terms', 
+                           'login', 'signup', 'explore', 'discover', 'events', 'organizers',
+                           'venues', 'contact', 'blog', 'jobs', 'press', 'api', 'docs',
+                           'create', 'event', 'description', 'slug', 'url', 'image', 'info',
+                           'hero_image_mobile_url', 'hero_image_desktop_url', 'is_free',
+                           'virtual_info', 'personal_user'}
+                json_patterns = [
+                    r'^[a-z_]+$',  # snake_case
+                    r'^[a-z]+[A-Z]',  # camelCase
+                ]
+                for script in scripts:
+                    if script.string:
+                        # Extract all lu.ma URLs from scripts
+                        script_urls = re.findall(r'https?://(?:lu\.ma|luma\.com)/([a-zA-Z0-9_-]+)', script.string)
+                        for url_id in script_urls:
+                            # Skip excluded and non-event patterns
+                            if url_id.lower() in excluded:
+                                continue
+                            if url_id.startswith(('usr-', 'cal-', 'org-')):
+                                continue
+                            # Skip JSON property names
+                            if any(re.match(pattern, url_id) for pattern in json_patterns):
+                                continue
+                            # Skip if too short - reduced from 6 to 4 to catch more events
+                            if len(url_id) < 4:
+                                continue
+                            # Skip if all lowercase and very short (unless it's evt-)
+                            # Be more lenient - allow longer lowercase strings
+                            if url_id.islower() and len(url_id) < 8 and not url_id.startswith('evt-'):
+                                continue
+                            all_urls.add(f"https://lu.ma/{url_id}")
+                logger.info(f"🔗 Found {len(all_urls)} total URLs after checking scripts")
+            except Exception as e:
+                logger.warning(f"⚠️ Error parsing scripts: {e}")
+        
+        # Method 4: Look for data attributes
+        if soup:
+            try:
+                excluded = {'sf', 'ios', 'android', 'web', 'about', 'help', 'privacy', 'terms', 
+                           'login', 'signup', 'explore', 'discover', 'events', 'organizers',
+                           'venues', 'contact', 'blog', 'jobs', 'press', 'api', 'docs',
+                           'create', 'event', 'description', 'slug', 'url', 'image', 'info'}
+                json_patterns = [
+                    r'^[a-z_]+$',  # snake_case
+                    r'^[a-z]+[A-Z]',  # camelCase
+                ]
+                # Find elements with data-event-id or similar attributes
+                for elem in soup.find_all(attrs=lambda x: x and any(k.startswith('data-') for k in x.keys())):
+                    for attr, value in elem.attrs.items():
+                        if attr.startswith('data-') and isinstance(value, str):
+                            # Skip excluded and non-event patterns
+                            if value.lower() in excluded:
+                                continue
+                            if value.startswith(('usr-', 'cal-', 'org-')):
+                                continue
+                            # Skip JSON property names
+                            if any(re.match(pattern, value) for pattern in json_patterns):
+                                continue
+                            # Skip if too short - reduced from 6 to 4 to catch more events
+                            if len(value) < 4:
+                                continue
+                            # Skip if all lowercase and very short (unless it's evt-)
+                            # Be more lenient - allow longer lowercase strings
+                            if value.islower() and len(value) < 8 and not value.startswith('evt-'):
+                                continue
+                            all_urls.add(f"https://lu.ma/{value}")
+                logger.info(f"🔗 Found {len(all_urls)} total URLs after checking data attributes")
+            except Exception as e:
+                logger.warning(f"⚠️ Error parsing data attributes: {e}")
+        
+        # Convert to list and dedupe
+        urls = list(all_urls)
+        logger.info(f"✅ Total unique URLs found: {len(urls)}")
+        if urls:
+            logger.info(f"📋 Sample URLs: {urls[:5]}")
+        
+        # If we have URLs, return them
+        if urls:
+            logger.info(f"📋 Returning {min(len(urls), max_events)} URLs (will filter by relevance later)")
+            return {"event_urls": urls[:max_events]}
+        else:
+            logger.warning("⚠️ No URLs found in HTML")
+            return {"event_urls": []}
+    else:
+        logger.error("❌ No HTML content retrieved")
         return {"event_urls": []}
 
 
@@ -135,13 +385,37 @@ model evaluation, prompt engineering, AI safety, AI observability, agent framewo
 
 @judgment.observe(span_type="tool")
 async def _extract_event_details(url: str, timeout_seconds: int = 60) -> dict[str, Any]:
-    """Use Agent SDK to extract event details from a single Luma page."""
+    """Extract event details using direct HTTP + Anthropic API (no Agent SDK)."""
     
-    prompt = f"""Fetch {url} and extract the event details.
+    result = {"url": url, "title": "", "date_text": "", "venue_text": "", "organizer_text": "", "description_text": ""}
+    
+    try:
+        logger.debug(f"🔍 Fetching event page: {url}")
+        
+        # Fetch the event page directly
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            response = await client.get(url, follow_redirects=True)
+            response.raise_for_status()
+            html = response.text
+            logger.debug(f"✅ Fetched {len(html)} chars from {url}")
+            
+            # Use BeautifulSoup to extract text content (cleaner for Claude)
+            soup = BeautifulSoup(html, 'lxml')
+            # Remove script and style elements
+            for script in soup(["script", "style"]):
+                script.decompose()
+            text_content = soup.get_text(separator=' ', strip=True)
+            # Limit to first 8000 chars to avoid token limits
+            text_content = text_content[:8000]
+            
+            # Use Anthropic API directly to extract structured data
+            prompt = f"""Extract event details from this Luma event page HTML content:
+
+{text_content}
 
 Return a JSON object with:
 - title: event title
-- date_text: the event date and time (e.g. "January 25, 2026 6:00 PM" or "Jan 25, 2026"). Look for the date near the top of the page.
+- date_text: the event date and time (e.g. "January 25, 2026 6:00 PM" or "Jan 25, 2026")
 - venue_text: location address or "Online" if virtual
 - organizer_text: who is hosting the event
 - description_text: event description (first 500 chars)
@@ -150,33 +424,26 @@ IMPORTANT: Make sure to extract the actual date - look for patterns like "Januar
 
 Return ONLY the JSON object, no other text."""
 
-    result = {"url": url, "title": "", "date_text": "", "venue_text": "", "organizer_text": "", "description_text": ""}
-    
-    async def _extract_inner():
-        try:
-            async for message in query(
-                prompt=prompt,
-                options=ClaudeAgentOptions(
-                    allowed_tools=["WebFetch"],
-                )
-            ):
-                if hasattr(message, "result"):
-                    parsed = _extract_json_from_text(message.result)
-                    if parsed:
-                        result.update(parsed)
-                        result["url"] = url
-                        return result  # Return early if we got a result
-        except Exception as e:
-            print(f"[WARN] Failed to extract details from {url}: {e}")
-        return result
-    
-    try:
-        # Add timeout to prevent hanging
-        result = await asyncio.wait_for(_extract_inner(), timeout=timeout_seconds)
+            logger.debug(f"🤖 Using Anthropic API to extract details from {url}...")
+            api_response = anthropic_client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=500,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            
+            result_text = api_response.content[0].text if api_response.content else ""
+            parsed = _extract_json_from_text(result_text)
+            if parsed:
+                result.update(parsed)
+                result["url"] = url
+                logger.debug(f"✅ Extracted details for {url}: {result.get('title', 'no title')[:50]}")
+            else:
+                logger.warning(f"⚠️ Could not parse JSON from API response for {url}")
+                
     except asyncio.TimeoutError:
-        print(f"[WARN] Timeout ({timeout_seconds}s) extracting details from {url}")
+        logger.warning(f"⏱️ Timeout ({timeout_seconds}s) extracting details from {url}")
     except Exception as e:
-        print(f"[WARN] Error extracting details from {url}: {e}")
+        logger.warning(f"❌ Error extracting details from {url}: {e}")
     
     return result
 
@@ -185,8 +452,9 @@ Return ONLY the JSON object, no other text."""
 def _check_relevance_with_claude(event: dict[str, Any]) -> dict[str, Any]:
     """Use direct Anthropic API to determine if an event is relevant (much faster than Agent SDK)."""
     
-    title = event.get("title", "")
-    description = event.get("description_text", "")[:800]
+    title = event.get("title") or ""
+    description_raw = event.get("description_text")
+    description = (description_raw[:800] if description_raw else "") or ""
     
     prompt = f"""{JUDGMENT_LABS_CONTEXT}
 
@@ -194,10 +462,19 @@ Analyze this event:
 Title: {title}
 Description: {description}
 
-Is this event relevant to Judgment Labs' field?
+Is this event highly relevant to Judgment Labs' field? Be strict - only mark as relevant if the event is directly related to:
+- AI agent monitoring, observability, or reliability
+- LLM evaluation, scoring, or debugging
+- Production AI safety or agent optimization
+- Agent frameworks or AI infrastructure
 
 Return ONLY a JSON object:
-{{"is_relevant": true/false, "relevance_score": 0.0-1.0, "reason": "brief explanation", "matched_topics": ["topic1", "topic2"]}}"""
+{{"is_relevant": true/false, "relevance_score": 0.0-1.0, "reason": "brief explanation", "matched_topics": ["topic1", "topic2"]}}
+
+Use a strict scoring scale:
+- 0.7-1.0: Highly relevant, directly related to Judgment Labs' core focus
+- 0.5-0.7: Moderately relevant, tangentially related
+- 0.0-0.5: Not relevant or only loosely related"""
 
     result = {"is_relevant": False, "relevance_score": 0.0, "reason": "", "matched_topics": []}
     
@@ -220,13 +497,13 @@ Return ONLY a JSON object:
 @judgment.observe(span_type="function")
 def _check_relevance_all(events: list[dict]) -> list[dict]:
     """Check relevance for all events using direct API (fast, synchronous)."""
-    print(f"[INFO] Checking relevance for {len(events)} events...")
+    logger.info(f"🔍 Checking relevance for {len(events)} events...")
     results = []
     for i, ev in enumerate(events):
         if (i + 1) % 5 == 0:
-            print(f"[INFO] Checked {i + 1}/{len(events)} events...")
+            logger.info(f"✅ Checked {i + 1}/{len(events)} events...")
         results.append(_check_relevance_with_claude(ev))
-    print(f"[INFO] Relevance check complete.")
+    logger.info(f"✅ Relevance check complete.")
     
     # Online evaluation: monitor relevance decision quality
     relevant_count = sum(1 for r in results if r.get("is_relevant"))
@@ -254,15 +531,18 @@ def _check_relevance_all(events: list[dict]) -> list[dict]:
 
 
 @judgment.observe(span_type="function")
-async def _extract_all_events_parallel(urls: list[str], batch_size: int = 5, timeout_per_batch: int = 90) -> list[dict]:
-    """Extract event details in parallel batches for speed."""
+async def _extract_all_events_parallel(urls: list[str], batch_size: int = 2, timeout_per_batch: int = 90) -> list[dict]:
+    """Extract event details in parallel batches for speed.
+    
+    Reduced batch_size from 5 to 2 to save memory on cloud deployments.
+    """
     all_results = []
     total_batches = (len(urls) + batch_size - 1) // batch_size
     
     for i in range(0, len(urls), batch_size):
         batch = urls[i:i + batch_size]
         batch_num = i//batch_size + 1
-        print(f"[INFO] Extracting batch {batch_num}/{total_batches} ({len(batch)} events)...")
+        logger.info(f"📦 Extracting batch {batch_num}/{total_batches} ({len(batch)} events)...")
         
         async def process_batch():
             # Run batch in parallel with individual timeouts
@@ -273,7 +553,7 @@ async def _extract_all_events_parallel(urls: list[str], batch_size: int = 5, tim
             # Add timeout for the entire batch
             results = await asyncio.wait_for(process_batch(), timeout=timeout_per_batch)
         except asyncio.TimeoutError:
-            print(f"[WARN] Batch {batch_num} timed out after {timeout_per_batch}s, skipping remaining events in batch")
+            logger.warning(f"⏱️ Batch {batch_num} timed out after {timeout_per_batch}s, skipping remaining events in batch")
             # Create empty results for timed-out batch
             results = [{"url": url, "title": "", "date_text": "", "venue_text": "", "organizer_text": "", "description_text": ""} 
                       for url in batch]
@@ -281,27 +561,34 @@ async def _extract_all_events_parallel(urls: list[str], batch_size: int = 5, tim
         # Process results
         for url, result in zip(batch, results):
             if isinstance(result, Exception):
-                print(f"[WARN] Failed to load {url}: {result}")
+                logger.warning(f"⚠️ Failed to load {url}: {result}")
                 all_results.append({"url": url, "title": "", "date_text": "", "venue_text": "", "organizer_text": "", "description_text": ""})
             else:
                 all_results.append(result)
         
-        print(f"[INFO] Completed batch {batch_num}/{total_batches}")
+        logger.info(f"✅ Completed batch {batch_num}/{total_batches}")
     
-    print(f"[INFO] Finished extracting {len(all_results)} events")
+    logger.info(f"✅ Finished extracting {len(all_results)} events")
     return all_results
 
 
 @judgment.observe(span_type="chain")
 async def _run_full_pipeline(days: int, max_events: int) -> tuple[list[str], list[dict]]:
     """Run URL collection and event extraction in async context."""
+    logger.info(f"🚀 Starting full pipeline: days={days}, max_events={max_events}")
+    
     # Step 1: Collect URLs
+    logger.info("📍 Step 1: Collecting event URLs...")
     agent_result = await _run_agent_sdk(days=days, max_events=max_events)
     urls = agent_result.get("event_urls", []) or []
+    logger.info(f"✅ Step 1 complete: Collected {len(urls)} URLs")
     
-    # Step 2: Extract details in parallel
-    extracted_list = await _extract_all_events_parallel(urls[:max_events], batch_size=5)
+    # Step 2: Extract details in parallel (reduced batch size for memory efficiency)
+    logger.info(f"📍 Step 2: Extracting details from {len(urls[:max_events])} URLs...")
+    extracted_list = await _extract_all_events_parallel(urls[:max_events], batch_size=2)
+    logger.info(f"✅ Step 2 complete: Extracted {len(extracted_list)} event details")
     
+    logger.info("✅ Full pipeline complete!")
     return urls, extracted_list
 
 
@@ -320,17 +607,23 @@ def scrape_luma_events_with_agent(
 ) -> list[Event]:
     """Main entry point - runs the Claude Agent SDK to scrape Luma events."""
     
+    logger.info(f"🎯 Starting scrape_luma_events_with_agent: days={days}, max_events={max_events}")
+    
     # Run the async pipeline (URL collection + extraction)
+    logger.info("🔄 Running async pipeline...")
     urls, extracted_list = asyncio.run(_run_full_pipeline(days=days, max_events=max_events))
     
-    print(f"[DEBUG] event_urls count: {len(urls)}")
+    logger.info(f"📊 Pipeline results: {len(urls)} URLs, {len(extracted_list)} extracted details")
     if urls:
-        print(f"[DEBUG] first 3 URLs: {urls[:3]}")
-    print(f"[DEBUG] extracted {len(extracted_list)} event details")
+        logger.info(f"🔗 First 3 URLs: {urls[:3]}")
     
     # Run relevance checking synchronously (fast direct API calls)
     relevance_list = _check_relevance_all(extracted_list)
     
+    # Initialize events list (must be outside conditional)
+    events: list[Event] = []
+    now = datetime.now().replace(tzinfo=None)
+
     # Online evaluation: only run if we have valid URLs to evaluate
     if urls:
         try:
@@ -345,9 +638,6 @@ def scrape_luma_events_with_agent(
         except Exception as e:
             print(f"[DEBUG] Online evaluation skipped: {e}")
 
-    events: list[Event] = []
-    now = datetime.now().replace(tzinfo=None)
-
     # Process extracted details with agent-based relevance
     for idx, (extracted, relevance) in enumerate(zip(extracted_list, relevance_list)):
         url = extracted.get("url", "")
@@ -358,10 +648,16 @@ def scrape_luma_events_with_agent(
         title = (extracted.get("title") or "").strip()
         date_text = extracted.get("date_text") or ""
         venue_raw = extracted.get("venue_text") or ""
+        description = (extracted.get("description_text") or "").strip()
         is_relevant = relevance.get("is_relevant", False)
         rel_score = relevance.get("relevance_score", 0.0)
         rel_reason = relevance.get("reason", "")
         matched_topics = relevance.get("matched_topics", [])
+        
+        # Skip events with no title or description (invalid/incomplete extraction)
+        if not title and not description:
+            print(f"[DEBUG] Event {idx+1}: SKIPPED - No title or description (invalid event)")
+            continue
         
         print(f"[DEBUG] Event {idx+1}: '{title[:40]}' | relevant={is_relevant} | score={rel_score:.2f}")
         print(f"[DEBUG]   date_text: '{date_text[:60] if date_text else 'EMPTY'}'")
@@ -389,9 +685,10 @@ def scrape_luma_events_with_agent(
             matched_keywords=matched_topics,
         )
 
-        # Check relevance FIRST (most important filter)
-        if not is_relevant or rel_score < 0.3:
-            print(f"[DEBUG]   -> FILTERED: not relevant to Judgment Labs")
+        # Check relevance FIRST (most important filter) - tightened threshold
+        # Increased from 0.3 to 0.5 to be more selective
+        if not is_relevant or rel_score < 0.5:
+            print(f"[DEBUG]   -> FILTERED: not relevant to Judgment Labs (score={rel_score:.2f} < 0.5)")
             continue
 
         # Date filter - be lenient if we can't parse the date but event is relevant
@@ -410,7 +707,14 @@ def scrape_luma_events_with_agent(
         events.append(ev)
         print(f"[INFO] -> MATCHED: {ev.title[:50]}... (score={rel_score:.2f})")
 
-    events.sort(key=lambda e: (e.start_at or datetime.max, -e.relevance_score))
+    # Sort by relevance score (highest first), then by date
+    events.sort(key=lambda e: (-e.relevance_score, e.start_at or datetime.max))
+    
+    # Limit to top 7 events (tightened criteria)
+    max_events_to_return = 7
+    if len(events) > max_events_to_return:
+        logger.info(f"📊 Limiting results from {len(events)} to top {max_events_to_return} events by relevance score")
+        events = events[:max_events_to_return]
     
     # Online evaluation: check final event extraction quality
     if events:
@@ -489,4 +793,4 @@ def scrape_luma_events_with_agent(
         except Exception as e:
             print(f"[DEBUG] Summary evaluation skipped: {e}")
     
-    return events
+        return events
